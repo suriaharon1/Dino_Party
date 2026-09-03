@@ -70,6 +70,7 @@ server.on("upgrade", (req, socket) => {
     buffer: Buffer.alloc(0),
     joined: false,
   };
+  socket.setNoDelay(true);
   clients.set(socket, client);
 
   socket.on("data", (chunk) => handleSocketData(client, chunk));
@@ -129,12 +130,16 @@ function handleMessage(client, text) {
 
   if (message.action === "start") {
     game.running = true;
+    rememberInput(player, message.seq);
     queueJump(player);
   } else if (message.action === "jump") {
+    rememberInput(player, message.seq);
     queueJump(player);
   } else if (message.action === "duck") {
+    rememberInput(player, message.seq);
     player.duckHeld = Boolean(message.active);
   } else if (message.action === "restart") {
+    rememberInput(player, message.seq);
     resetGame();
   }
 }
@@ -177,7 +182,10 @@ function resetGame() {
   game = makeGame();
   game.running = true;
   for (const oldPlayer of oldPlayers) {
-    game.players.set(oldPlayer.id, makePlayer(oldPlayer.id, oldPlayer.name));
+    const player = makePlayer(oldPlayer.id, oldPlayer.name);
+    player.lastReceivedInputSeq = oldPlayer.lastReceivedInputSeq;
+    player.lastProcessedInputSeq = oldPlayer.lastReceivedInputSeq;
+    game.players.set(oldPlayer.id, player);
   }
 }
 
@@ -194,6 +202,8 @@ function makePlayer(id, name) {
     ducking: false,
     duckHeld: false,
     jumpQueued: false,
+    lastReceivedInputSeq: 0,
+    lastProcessedInputSeq: 0,
     runFrame: 0,
     score: 0,
   };
@@ -240,6 +250,8 @@ function updateGame(dt) {
       player.alive = false;
       player.ducking = false;
     }
+
+    player.lastProcessedInputSeq = player.lastReceivedInputSeq;
   }
 
   if (game.players.size > 0 && [...game.players.values()].every((player) => !player.alive)) {
@@ -250,6 +262,12 @@ function updateGame(dt) {
 function queueJump(player) {
   player.jumpQueued = true;
   player.duckHeld = false;
+}
+
+function rememberInput(player, seq) {
+  if (Number.isSafeInteger(seq) && seq > player.lastReceivedInputSeq) {
+    player.lastReceivedInputSeq = seq;
+  }
 }
 
 function updateScenery(dt) {
@@ -342,12 +360,15 @@ function publicStateFor(clientId) {
         name: player.name,
         x: player.x,
         y: player.y,
+        vy: player.vy,
         color: player.color,
         alive: player.alive,
         ducking: player.ducking,
+        duckHeld: player.duckHeld,
         onGround: onGround(player),
         runFrame: player.runFrame,
         score: player.score,
+        lastProcessedInputSeq: player.lastProcessedInputSeq,
       })),
       obstacles: game.obstacles,
       clouds: game.clouds,

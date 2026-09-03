@@ -9,6 +9,8 @@ const WORLD = {
   width: 960,
   height: 300,
   groundY: 232,
+  gravity: 2450,
+  jumpVelocity: -760,
 };
 
 const sprites = makeSpriteAtlas();
@@ -21,6 +23,10 @@ let state = blankState();
 let highScore = Number(localStorage.getItem("dino-party-hi") || 0);
 let reconnectTimer = null;
 let lastServerTick = 0;
+let nextInputSeq = 1;
+let pendingInputs = [];
+let predictedPlayer = null;
+let lastPredictionAt = performance.now();
 
 connect();
 requestAnimationFrame(frame);
@@ -35,17 +41,17 @@ window.addEventListener("keydown", (event) => {
   }
 
   if (event.code === "Space" || event.code === "ArrowUp" || event.code === "KeyW") {
-    send({ type: "input", action: state.gameOver ? "restart" : state.running ? "jump" : "start" });
+    sendInput(state.gameOver ? "restart" : state.running ? "jump" : "start");
   } else if (event.code === "ArrowDown" || event.code === "KeyS") {
-    send({ type: "input", action: "duck", active: true });
+    sendInput("duck", true);
   } else if (event.code === "KeyR") {
-    send({ type: "input", action: "restart" });
+    sendInput("restart");
   }
 });
 
 window.addEventListener("keyup", (event) => {
   if (event.code === "ArrowDown" || event.code === "KeyS") {
-    send({ type: "input", action: "duck", active: false });
+    sendInput("duck", false);
   }
 });
 
@@ -69,6 +75,7 @@ function connect() {
     if (message.type === "state") {
       localPlayerId = message.you ?? localPlayerId;
       state = message.state;
+      reconcilePrediction();
       lastServerTick = performance.now();
       highScore = Math.max(highScore, Math.floor(state.score));
       localStorage.setItem("dino-party-hi", String(highScore));
@@ -89,10 +96,33 @@ function connect() {
 function send(message) {
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(message));
+    return true;
   }
+  return false;
+}
+
+function sendInput(action, active) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  const input = {
+    type: "input",
+    action,
+    seq: nextInputSeq++,
+  };
+
+  if (typeof active === "boolean") {
+    input.active = active;
+  }
+
+  pendingInputs.push(input);
+  applyLocalInput(input);
+  send(input);
 }
 
 function frame() {
+  updatePrediction();
   draw();
   requestAnimationFrame(frame);
 }
@@ -108,6 +138,145 @@ function blankState() {
     clouds: [],
     groundMarks: [],
   };
+}
+
+function reconcilePrediction() {
+  const serverPlayer = state.players.find((player) => player.id === localPlayerId);
+  if (!serverPlayer) {
+    predictedPlayer = null;
+    pendingInputs = [];
+    return;
+  }
+
+  const ackSeq = serverPlayer.lastProcessedInputSeq || 0;
+  pendingInputs = pendingInputs.filter((input) => input.seq > ackSeq);
+  predictedPlayer = clonePlayer(serverPlayer);
+
+  for (const input of pendingInputs) {
+    applyPredictedInput(predictedPlayer, input);
+  }
+
+  lastPredictionAt = performance.now();
+  replaceLocalPlayer(predictedPlayer);
+}
+
+function applyLocalInput(input) {
+  if (input.action === "start") {
+    state.running = true;
+  } else if (input.action === "restart") {
+    state.running = true;
+    state.gameOver = false;
+  }
+
+  if (!predictedPlayer) {
+    const serverPlayer = state.players.find((player) => player.id === localPlayerId);
+    predictedPlayer = serverPlayer ? clonePlayer(serverPlayer) : null;
+  }
+
+  if (predictedPlayer) {
+    applyPredictedInput(predictedPlayer, input);
+    replaceLocalPlayer(predictedPlayer);
+  }
+}
+
+function applyPredictedInput(player, input) {
+  if (input.action === "restart") {
+    player.y = WORLD.groundY;
+    player.vy = 0;
+    player.alive = true;
+    player.ducking = false;
+    player.duckHeld = false;
+    player.onGround = true;
+    player.runFrame = 0;
+    return;
+  }
+
+  if (!player.alive) {
+    return;
+  }
+
+  if (input.action === "start" || input.action === "jump") {
+    player.duckHeld = false;
+    if (isPredictedOnGround(player)) {
+      player.vy = WORLD.jumpVelocity;
+      player.ducking = false;
+      player.onGround = false;
+    }
+  } else if (input.action === "duck") {
+    player.duckHeld = Boolean(input.active);
+    player.ducking = player.duckHeld && isPredictedOnGround(player);
+  }
+}
+
+function updatePrediction() {
+  const now = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (now - lastPredictionAt) / 1000));
+  lastPredictionAt = now;
+
+  const hasRunIntent = pendingInputs.some((input) => input.action === "start" || input.action === "restart");
+  if (hasRunIntent) {
+    state.running = true;
+    state.gameOver = false;
+  }
+
+  if (!predictedPlayer) {
+    return;
+  }
+
+  const authoritativePlayer = state.players.find((player) => player.id === localPlayerId);
+  if (!authoritativePlayer) {
+    predictedPlayer = null;
+    return;
+  }
+
+  if (!authoritativePlayer.alive || state.gameOver) {
+    predictedPlayer = clonePlayer(authoritativePlayer);
+    pendingInputs = pendingInputs.filter((input) => input.action === "restart");
+    replaceLocalPlayer(predictedPlayer);
+    return;
+  }
+
+  simulatePredictedPlayer(predictedPlayer, dt, state.speed);
+  replaceLocalPlayer(predictedPlayer);
+}
+
+function simulatePredictedPlayer(player, dt, speed) {
+  if (!player.alive || dt <= 0) {
+    return;
+  }
+
+  player.ducking = player.duckHeld && isPredictedOnGround(player);
+  player.vy += WORLD.gravity * dt;
+  player.y += player.vy * dt;
+
+  if (player.y >= WORLD.groundY) {
+    player.y = WORLD.groundY;
+    player.vy = 0;
+  }
+
+  player.onGround = isPredictedOnGround(player);
+  if (player.onGround) {
+    player.runFrame += dt * (speed / 48);
+  }
+}
+
+function replaceLocalPlayer(player) {
+  const index = state.players.findIndex((candidate) => candidate.id === localPlayerId);
+  if (index !== -1) {
+    state.players[index] = { ...player };
+  }
+}
+
+function clonePlayer(player) {
+  return {
+    ...player,
+    vy: player.vy || 0,
+    duckHeld: Boolean(player.duckHeld),
+  };
+}
+
+function isPredictedOnGround(player) {
+  return Math.abs(player.y - WORLD.groundY) < 0.5;
 }
 
 function draw() {
