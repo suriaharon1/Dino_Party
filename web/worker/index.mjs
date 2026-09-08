@@ -1,11 +1,3 @@
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const http = require("node:http");
-const path = require("node:path");
-
-const PORT = Number(process.argv[2] || 5173);
-const ROOT = path.join(__dirname, "public");
-const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_PLAYERS_PER_ROOM = 5;
 const ROOM_ID_LENGTH = 5;
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -22,254 +14,231 @@ const WORLD = {
   maxSpeed: 760,
 };
 
-const colors = ["#202124", "#0b8043", "#1967d2", "#b06000", "#a142f4", "#c5221f"];
+const colors = ["#202124", "#0b8043", "#1967d2", "#b06000", "#a142f4"];
 const HIT_SPRITES = makeHitSprites();
-let nextPlayerId = 1;
-const clients = new Map();
-const rooms = new Map();
-const rand = mulberry32(20260829);
 
-const server = http.createServer((req, res) => {
-  const urlPath = decodeURIComponent(new URL(req.url, `http://${req.headers.host}`).pathname);
-  const requestedPath = urlPath === "/" ? "/index.html" : urlPath;
-  const filePath = path.normalize(path.join(ROOT, requestedPath));
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-  if (!filePath.startsWith(ROOT)) {
-    res.writeHead(403);
-    res.end("Forbidden");
-    return;
+    if (url.pathname === "/ws") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("Expected WebSocket upgrade", { status: 426 });
+      }
+
+      const roomId = normalizeRoomId(url.searchParams.get("room"));
+      if (!roomId) {
+        return new Response("Missing room", { status: 400 });
+      }
+
+      const id = env.ROOMS.idFromName(roomId);
+      return env.ROOMS.get(id).fetch(request);
+    }
+
+    return env.ASSETS.fetch(request);
+  },
+};
+
+export class GameRoom {
+  constructor(state) {
+    this.state = state;
+    this.roomId = "";
+    this.nextPlayerId = 1;
+    this.clients = new Map();
+    this.rand = mulberry32(20260829);
+    this.game = makeGame(this.rand);
+    this.hostId = null;
+    this.last = Date.now();
+    this.accumulator = 0;
+    this.loop = null;
   }
 
-  fs.readFile(filePath, (error, contents) => {
-    if (error) {
-      res.writeHead(404);
-      res.end("Not found");
+  async fetch(request) {
+    const url = new URL(request.url);
+    this.roomId = normalizeRoomId(url.searchParams.get("room")) || this.roomId;
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+
+    const connection = {
+      id: null,
+      socket: server,
+      joined: false,
+    };
+    this.clients.set(server, connection);
+
+    server.addEventListener("message", (event) => this.handleMessage(connection, event.data));
+    server.addEventListener("close", () => this.removeClient(connection));
+    server.addEventListener("error", () => this.removeClient(connection));
+
+    this.ensureLoop();
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  handleMessage(client, data) {
+    let message;
+    try {
+      message = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data));
+    } catch {
       return;
     }
 
-    res.writeHead(200, { "Content-Type": contentType(filePath) });
-    res.end(contents);
-  });
-});
-
-server.on("upgrade", (req, socket) => {
-  if (!req.headers["sec-websocket-key"]) {
-    socket.destroy();
-    return;
-  }
-
-  const accept = crypto
-    .createHash("sha1")
-    .update(req.headers["sec-websocket-key"] + GUID)
-    .digest("base64");
-
-  socket.write(
-    "HTTP/1.1 101 Switching Protocols\r\n" +
-      "Upgrade: websocket\r\n" +
-      "Connection: Upgrade\r\n" +
-      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-  );
-
-  const client = {
-    id: nextPlayerId++,
-    socket,
-    buffer: Buffer.alloc(0),
-    joined: false,
-  };
-  socket.setNoDelay(true);
-  clients.set(socket, client);
-
-  socket.on("data", (chunk) => handleSocketData(client, chunk));
-  socket.on("close", () => removeClient(client));
-  socket.on("error", () => removeClient(client));
-});
-
-server.listen(PORT, () => {
-  console.log(`Dino Party multiplayer running at http://localhost:${PORT}`);
-});
-
-let last = performance.now();
-let accumulator = 0;
-const tickSeconds = 1 / 120;
-
-setInterval(() => {
-  const now = performance.now();
-  accumulator += Math.min(0.05, (now - last) / 1000);
-  last = now;
-
-  while (accumulator >= tickSeconds) {
-    for (const room of rooms.values()) {
-      updateGame(room.game, tickSeconds);
+    if (message.type === "join") {
+      this.joinRoom(client, message);
+      return;
     }
-    accumulator -= tickSeconds;
+
+    if (message.type === "ping") {
+      client.socket.send(
+        JSON.stringify({
+          type: "pong",
+          id: message.id,
+          sentAt: message.sentAt,
+          serverAt: Date.now(),
+        }),
+      );
+      return;
+    }
+
+    const player = this.game.players.get(client.id);
+    if (!player) {
+      return;
+    }
+
+    if (message.type === "rename") {
+      player.name = cleanName(message.name, `Dino${client.id}`);
+      return;
+    }
+
+    if (message.type !== "input") {
+      return;
+    }
+
+    const isHost = this.hostId === client.id;
+    if (message.action === "start") {
+      rememberInput(player, message.seq);
+      if (isHost && !this.game.running && !this.game.gameOver) {
+        this.game.running = true;
+      }
+    } else if (message.action === "jump") {
+      rememberInput(player, message.seq);
+      queueJump(player);
+    } else if (message.action === "duck") {
+      rememberInput(player, message.seq);
+      player.duckHeld = Boolean(message.active);
+    } else if (message.action === "restart") {
+      rememberInput(player, message.seq);
+      if (isHost) {
+        this.resetGame();
+      }
+    }
   }
 
-  broadcastState();
-}, 1000 / BROADCAST_HZ);
+  joinRoom(client, message) {
+    if (client.joined) {
+      return;
+    }
 
-function handleSocketData(client, chunk) {
-  client.buffer = Buffer.concat([client.buffer, chunk]);
-  const messages = decodeFrames(client);
-  for (const message of messages) {
-    handleMessage(client, message);
-  }
-}
-
-function handleMessage(client, text) {
-  let message;
-  try {
-    message = JSON.parse(text);
-  } catch {
-    return;
-  }
-
-  if (message.type === "join") {
-    const room = getOrCreateRoom(message.room);
-    if (room.game.players.size >= MAX_PLAYERS_PER_ROOM) {
-      sendFrame(
-        client.socket,
+    if (this.game.players.size >= MAX_PLAYERS_PER_ROOM) {
+      client.socket.send(
         JSON.stringify({
           type: "rejected",
           reason: "room-full",
-          room: room.id,
+          room: this.roomId,
           maxPlayers: MAX_PLAYERS_PER_ROOM,
         }),
       );
-      client.socket.end();
+      client.socket.close(1008, "Room full");
       return;
     }
 
+    client.id = this.nextPlayerId++;
     client.joined = true;
-    client.roomId = room.id;
+
     const name = String(message.name || `Dino${client.id}`).slice(0, 12);
-    room.game.players.set(client.id, makePlayer(client.id, name));
-    if (!room.hostId) {
-      room.hostId = client.id;
+    this.game.players.set(client.id, makePlayer(client.id, name));
+    if (!this.hostId) {
+      this.hostId = client.id;
     }
 
-    sendFrame(
-      client.socket,
+    client.socket.send(
       JSON.stringify({
         type: "welcome",
         id: client.id,
-        room: room.id,
-        host: room.hostId === client.id,
+        room: this.roomId,
+        host: this.hostId === client.id,
         maxPlayers: MAX_PLAYERS_PER_ROOM,
       }),
     );
-    return;
+    this.broadcastState();
   }
 
-  if (message.type === "ping") {
-    sendFrame(
-      client.socket,
-      JSON.stringify({
-        type: "pong",
-        id: message.id,
-        sentAt: message.sentAt,
-        serverAt: Date.now(),
-      }),
-    );
-    return;
-  }
-
-  const room = getClientRoom(client);
-  const player = room?.game.players.get(client.id);
-  if (!player) {
-    return;
-  }
-
-  if (message.type === "rename") {
-    player.name = cleanName(message.name, `Dino${client.id}`);
-    return;
-  }
-
-  if (message.type !== "input") {
-    return;
-  }
-
-  const isHost = room.hostId === client.id;
-  if (message.action === "start") {
-    rememberInput(player, message.seq);
-    if (isHost && !room.game.running && !room.game.gameOver) {
-      room.game.running = true;
+  removeClient(client) {
+    if (!this.clients.has(client.socket)) {
+      return;
     }
-  } else if (message.action === "jump") {
-    rememberInput(player, message.seq);
-    queueJump(player);
-  } else if (message.action === "duck") {
-    rememberInput(player, message.seq);
-    player.duckHeld = Boolean(message.active);
-  } else if (message.action === "restart") {
-    rememberInput(player, message.seq);
-    if (isHost) {
-      resetGame(room);
+
+    this.clients.delete(client.socket);
+    if (client.id) {
+      this.game.players.delete(client.id);
+      if (this.hostId === client.id) {
+        const nextHost = this.game.players.keys().next();
+        this.hostId = nextHost.done ? null : nextHost.value;
+      }
+    }
+
+    this.broadcastState();
+    if (this.clients.size === 0 && this.loop) {
+      clearInterval(this.loop);
+      this.loop = null;
     }
   }
-}
 
-function removeClient(client) {
-  if (!clients.has(client.socket)) {
-    return;
-  }
-
-  clients.delete(client.socket);
-  const room = getClientRoom(client);
-  if (room) {
-    room.game.players.delete(client.id);
-    if (room.hostId === client.id) {
-      const nextHost = room.game.players.keys().next();
-      room.hostId = nextHost.done ? null : nextHost.value;
-    }
-    if (room.game.players.size === 0) {
-      rooms.delete(room.id);
+  resetGame() {
+    const oldPlayers = [...this.game.players.values()];
+    this.game = makeGame(this.rand);
+    for (const oldPlayer of oldPlayers) {
+      const player = makePlayer(oldPlayer.id, oldPlayer.name);
+      player.lastReceivedInputSeq = oldPlayer.lastReceivedInputSeq;
+      player.lastProcessedInputSeq = oldPlayer.lastReceivedInputSeq;
+      this.game.players.set(oldPlayer.id, player);
     }
   }
-  client.socket.destroy();
-}
 
-function getOrCreateRoom(requestedRoomId) {
-  const roomId = normalizeRoomId(requestedRoomId) || createRoomId();
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, {
-      id: roomId,
-      hostId: null,
-      game: makeGame(),
-    });
+  ensureLoop() {
+    if (this.loop) {
+      return;
+    }
+
+    this.last = Date.now();
+    this.loop = setInterval(() => {
+      const now = Date.now();
+      this.accumulator += Math.min(0.05, (now - this.last) / 1000);
+      this.last = now;
+
+      const tickSeconds = 1 / 120;
+      while (this.accumulator >= tickSeconds) {
+        updateGame(this.game, tickSeconds);
+        this.accumulator -= tickSeconds;
+      }
+
+      this.broadcastState();
+    }, 1000 / BROADCAST_HZ);
   }
-  return rooms.get(roomId);
+
+  broadcastState() {
+    for (const client of this.clients.values()) {
+      if (client.joined && client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(JSON.stringify(publicStateFor(this.roomId, this.hostId, this.game, client.id)));
+      }
+    }
+  }
 }
 
-function getClientRoom(client) {
-  return client.roomId ? rooms.get(client.roomId) : null;
-}
-
-function normalizeRoomId(value) {
-  const roomId = String(value || "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "")
-    .slice(0, ROOM_ID_LENGTH);
-  return roomId.length >= 3 ? roomId : "";
-}
-
-function cleanName(value, fallback) {
-  const name = String(value || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .slice(0, 12);
-  return name || fallback;
-}
-
-function createRoomId() {
-  let roomId = "";
-  do {
-    roomId = Array.from({ length: ROOM_ID_LENGTH }, () => ROOM_ALPHABET[Math.floor(Math.random() * ROOM_ALPHABET.length)]).join("");
-  } while (rooms.has(roomId));
-  return roomId;
-}
-
-function makeGame() {
+function makeGame(rand) {
   return {
+    rand,
     running: false,
     gameOver: false,
     tick: 0,
@@ -279,31 +248,20 @@ function makeGame() {
     players: new Map(),
     obstacles: [],
     clouds: Array.from({ length: 5 }, (_, index) => ({
-      x: index * 220 + randRange(0, 80),
-      y: randRange(42, 116),
-      scale: randRange(0.8, 1.6),
+      x: index * 220 + randRange(rand, 0, 80),
+      y: randRange(rand, 42, 116),
+      scale: randRange(rand, 0.8, 1.6),
     })),
     groundMarks: Array.from({ length: 34 }, (_, index) => ({
-      x: index * 42 + randRange(0, 16),
-      w: randRange(8, 22),
+      x: index * 42 + randRange(rand, 0, 16),
+      w: randRange(rand, 8, 22),
     })),
     nextObstacleIn: 1.2,
   };
 }
 
-function resetGame(room) {
-  const oldPlayers = [...room.game.players.values()];
-  room.game = makeGame();
-  for (const oldPlayer of oldPlayers) {
-    const player = makePlayer(oldPlayer.id, oldPlayer.name);
-    player.lastReceivedInputSeq = oldPlayer.lastReceivedInputSeq;
-    player.lastProcessedInputSeq = oldPlayer.lastReceivedInputSeq;
-    room.game.players.set(oldPlayer.id, player);
-  }
-}
-
 function makePlayer(id, name) {
-  const index = (id - 1) % 6;
+  const index = (id - 1) % colors.length;
   return {
     id,
     name: cleanName(name, `Dino${id}`),
@@ -396,17 +354,17 @@ function updateScenery(game, dt) {
   for (const cloud of game.clouds) {
     cloud.x -= game.speed * dt * 0.14 * cloud.scale;
     if (cloud.x < -80) {
-      cloud.x = WORLD.width + randRange(20, 140);
-      cloud.y = randRange(38, 112);
-      cloud.scale = randRange(0.8, 1.6);
+      cloud.x = WORLD.width + randRange(game.rand, 20, 140);
+      cloud.y = randRange(game.rand, 38, 112);
+      cloud.scale = randRange(game.rand, 0.8, 1.6);
     }
   }
 
   for (const mark of game.groundMarks) {
     mark.x -= game.speed * dt;
     if (mark.x < -30) {
-      mark.x = WORLD.width + randRange(0, 42);
-      mark.w = randRange(8, 24);
+      mark.x = WORLD.width + randRange(game.rand, 0, 42);
+      mark.w = randRange(game.rand, 8, 24);
     }
   }
 }
@@ -425,19 +383,19 @@ function spawnObstacles(game) {
     return;
   }
 
-  const type = rand() > 0.72 && game.time > 12 ? "bird" : "cactus";
-  const group = type === "cactus" ? 1 + Math.floor(rand() * 3) : 1;
+  const type = game.rand() > 0.72 && game.time > 12 ? "bird" : "cactus";
+  const group = type === "cactus" ? 1 + Math.floor(game.rand() * 3) : 1;
   game.obstacles.push({
     type,
     x: WORLD.width + 30,
-    y: type === "bird" ? WORLD.groundY - randChoice([78, 96, 112]) : WORLD.groundY,
+    y: type === "bird" ? WORLD.groundY - randChoice(game.rand, [78, 96, 112]) : WORLD.groundY,
     group,
     flap: 0,
     w: type === "bird" ? 56 : 24 + group * 16,
     h: type === "bird" ? 36 : 54,
   });
 
-  game.nextObstacleIn = randRange(0.72, 1.28) - Math.min(0.28, game.time * 0.003);
+  game.nextObstacleIn = randRange(game.rand, 0.72, 1.28) - Math.min(0.28, game.time * 0.003);
 }
 
 function collides(game, player) {
@@ -511,15 +469,14 @@ function onGround(player) {
   return Math.abs(player.y - WORLD.groundY) < 0.5;
 }
 
-function publicStateFor(room, clientId) {
-  const game = room.game;
+function publicStateFor(roomId, hostId, game, clientId) {
   return {
     type: "state",
     you: clientId,
     state: {
-      room: room.id,
-      hostId: room.hostId,
-      isHost: room.hostId === clientId,
+      room: roomId,
+      hostId,
+      isHost: hostId === clientId,
       maxPlayers: MAX_PLAYERS_PER_ROOM,
       running: game.running,
       gameOver: game.gameOver,
@@ -548,102 +505,27 @@ function publicStateFor(room, clientId) {
   };
 }
 
-function broadcastState() {
-  for (const client of clients.values()) {
-    const room = getClientRoom(client);
-    if (client.joined && room) {
-      sendFrame(client.socket, JSON.stringify(publicStateFor(room, client.id)));
-    }
-  }
+function normalizeRoomId(value) {
+  const roomId = String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, ROOM_ID_LENGTH);
+  return roomId.length >= 3 ? roomId : "";
 }
 
-function decodeFrames(client) {
-  const messages = [];
-  let offset = 0;
-
-  while (client.buffer.length - offset >= 2) {
-    const first = client.buffer[offset];
-    const second = client.buffer[offset + 1];
-    const opcode = first & 0x0f;
-    const masked = (second & 0x80) !== 0;
-    let length = second & 0x7f;
-    let headerLength = 2;
-
-    if (length === 126) {
-      if (client.buffer.length - offset < 4) break;
-      length = client.buffer.readUInt16BE(offset + 2);
-      headerLength = 4;
-    } else if (length === 127) {
-      client.socket.destroy();
-      return messages;
-    }
-
-    const maskLength = masked ? 4 : 0;
-    const frameLength = headerLength + maskLength + length;
-    if (client.buffer.length - offset < frameLength) {
-      break;
-    }
-
-    if (opcode === 8) {
-      client.socket.end();
-      offset += frameLength;
-      continue;
-    }
-
-    const maskStart = offset + headerLength;
-    const payloadStart = maskStart + maskLength;
-    const payload = Buffer.from(client.buffer.subarray(payloadStart, payloadStart + length));
-
-    if (masked) {
-      const mask = client.buffer.subarray(maskStart, maskStart + 4);
-      for (let index = 0; index < payload.length; index += 1) {
-        payload[index] ^= mask[index % 4];
-      }
-    }
-
-    if (opcode === 1) {
-      messages.push(payload.toString("utf8"));
-    }
-
-    offset += frameLength;
-  }
-
-  client.buffer = client.buffer.subarray(offset);
-  return messages;
+function cleanName(value, fallback) {
+  const name = String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 12);
+  return name || fallback;
 }
 
-function sendFrame(socket, text) {
-  const payload = Buffer.from(text);
-  let header;
-
-  if (payload.length < 126) {
-    header = Buffer.from([0x81, payload.length]);
-  } else if (payload.length < 65536) {
-    header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(payload.length, 2);
-  } else {
-    return;
-  }
-
-  socket.write(Buffer.concat([header, payload]));
-}
-
-function contentType(filePath) {
-  const extension = path.extname(filePath);
-  if (extension === ".html") return "text/html; charset=utf-8";
-  if (extension === ".css") return "text/css; charset=utf-8";
-  if (extension === ".js") return "text/javascript; charset=utf-8";
-  if (extension === ".png") return "image/png";
-  return "application/octet-stream";
-}
-
-function randRange(min, max) {
+function randRange(rand, min, max) {
   return min + rand() * (max - min);
 }
 
-function randChoice(items) {
+function randChoice(rand, items) {
   return items[Math.floor(rand() * items.length)];
 }
 

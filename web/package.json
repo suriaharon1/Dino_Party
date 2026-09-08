@@ -1,0 +1,14 @@
+{
+  "name": "dino-party",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js 5173",
+    "cf:dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check public/game.js && node --check server.js && node --check worker/index.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

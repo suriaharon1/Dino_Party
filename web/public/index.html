@@ -15,14 +15,34 @@
             <span id="score">00000</span>
             <span id="hiScore">HI 00000</span>
             <span id="mode">SOLO</span>
+            <span id="latency">PING --</span>
             <span id="status">offline</span>
           </div>
         </div>
         <canvas id="game" width="960" height="300"></canvas>
+        <form id="entryPanel" class="entry-panel">
+          <label>
+            Name
+            <input id="entryName" name="name" maxlength="12" autocomplete="nickname" />
+          </label>
+          <label>
+            Room
+            <input id="entryRoom" name="room" maxlength="5" autocomplete="off" placeholder="ABCDE" />
+          </label>
+          <div class="entry-actions">
+            <button id="joinRoom" type="submit">Join room</button>
+            <button id="createRoom" type="button">Create room</button>
+          </div>
+        </form>
         <div class="controls">
           <span>Space / Up: jump</span>
           <span>Down: duck</span>
-          <span>Open another tab/device to join</span>
+          <span id="roomInfo">Room: --</span>
+          <button id="copyInvite" type="button" disabled>Copy invite</button>
+          <form id="renameForm" class="rename-form">
+            <input id="renameInput" name="name" maxlength="12" autocomplete="nickname" />
+            <button type="submit">Rename</button>
+          </form>
           <span>R: restart</span>
         </div>
       </section>
